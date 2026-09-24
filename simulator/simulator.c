@@ -162,7 +162,7 @@ unsigned int execute_instruction(unsigned int program_counter, instruction_t* in
 	case movl_imm_reg: // 8
         registers[instr.first_register] = (signed) instr.immediate;
     break;
-    case cmpl: // 9
+    case cmpl: { // 9
         int op1 = registers[instr.first_register];
         int op2 = registers[instr.second_register];
 
@@ -193,6 +193,7 @@ unsigned int execute_instruction(unsigned int program_counter, instruction_t* in
             ((result < 0) != (op2 < 0))) {
             registers[16] |= 2048;
         }
+	}
     break;
 	case je: // 10
 		return (registers[16] & 64) ? (program_counter + 4) + instr.immediate : program_counter + 4;
