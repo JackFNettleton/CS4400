@@ -156,24 +156,26 @@ static pixel weighted_combo(int n, int i, int j, pixel *src)
   return current_pixel;
 }
 
-
-
 /******************************************************
  * Your different versions of the motion kernel go here
  ******************************************************/
 
  /*
-  * opt_motion - The naive baseline version of motion
+  * opt_motion - Sliding-window optimized version of motion
+  *
+  * Each output pixel is the average of the pixels in the 3x3 region
+  * beginning at (i,j).
   */
-char opt_motion_descr[] = "opt_motion: Optimized implementation";
+char opt_motion_descr[] = "opt_motion: Sliding-window implementation";
+
 void opt_motion(int n, pixel* src, pixel* dst)
 {
     int i, j;
 
-    // Partition the image in BLOCK x BLOCK tiles so both the source rows and the destination columns stay in the cache while working on a tile.
-    for (i = 0; i < n; i += BLOCK)
-        for (j = 0; j < n; j += BLOCK)
-            dst[RIDX(i, j, n)] = weighted_combo(n, i, j, src);
+    for (i = 0; i < n; i++)
+    {
+
+    }
 }
 
 /*
@@ -184,7 +186,6 @@ void naive_motion(int n, pixel *src, pixel *dst)
 {
   int i, j;
     
-  // Partition the image in BLOCK x BLOCK tiles so both the source rows and the destination columns stay in the cache while working on a tile.
   for (i = 0; i < n; i++)
       for (j = 0; j < n; j++)
         dst[RIDX(i, j, n)] = weighted_combo(n, i, j, src);
