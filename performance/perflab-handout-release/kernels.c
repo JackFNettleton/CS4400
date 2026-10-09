@@ -160,21 +160,94 @@ static pixel weighted_combo(int n, int i, int j, pixel *src)
  * Your different versions of the motion kernel go here
  ******************************************************/
 
+
+ // Helper struct to hold the sum of the RGB values of a window
+typedef struct {
+    int red;
+    int green;
+    int blue;
+} rgb_sum;
+
+// Helper function to return the minimum of two integers
+static inline int min_int(int a, int b)
+{
+    return a < b ? a : b;
+}
+
+// Helper function to update the sum of the RGB values in a window
+static inline void add_column(rgb_sum* sum, const pixel* src, int n,
+    int top, int rows, int col)
+{
+    int r;
+    for (r = 0; r < rows; r++)
+    {
+        const pixel* p = src + (top + r) * n + col;
+        sum->red += p->red;
+        sum->green += p->green;
+        sum->blue += p->blue;
+    }
+}
+
+// Helper function to update the sum of the RGB values in a window
+static inline void sub_column(rgb_sum* sum, const pixel* src, int n,
+    int top, int rows, int col)
+{
+    int r;
+    for (r = 0; r < rows; r++)
+    {
+        const pixel* p = src + (top + r) * n + col;
+        sum->red -= p->red;
+        sum->green -= p->green;
+        sum->blue -= p->blue;
+    }
+}
+
+// Helper function to store the average of the RGB values in the target pixel
+static inline void store_average(pixel* target, const rgb_sum* sum, int count)
+{
+    target->red = sum->red / count;
+    target->green = sum->green / count;
+    target->blue = sum->blue / count;
+}
+
  /*
-  * opt_motion - Sliding-window optimized version of motion
-  *
-  * Each output pixel is the average of the pixels in the 3x3 region
-  * beginning at (i,j).
-  */
-char opt_motion_descr[] = "opt_motion: Sliding-window implementation";
+ * opt_motion - Sliding-window optimized version of motion
+ *
+ * Each output pixel is the average of the (up to) 3x3 region beginning
+ * at (i,j). Moving one pixel right, we remove the leftmost column of the
+ * window and add the new rightmost column instead of re-summing all 9
+ * pixels.
+ * 
+ * I probably could have used pointer arithmetic and Row-Major order to make this even faster, but I wanted to keep it simple and readable. The performance is already quite good.
+ */
+char opt_motion_descr[] = "opt_motion: Optimized implementation";
 
 void opt_motion(int n, pixel* src, pixel* dst)
 {
-    int i, j;
+    int i, j, c;
 
     for (i = 0; i < n; i++)
     {
+		// Window height: shrinks to 2 or 1 near the bottom edge.
+        int rows = min_int(3, n - i);
 
+        // Build the initial window covering columns 0..2.
+        rgb_sum sum = { 0, 0, 0 };
+        for (c = 0; c < min_int(3, n); c++)
+            add_column(&sum, src, n, i, rows, c);
+
+        for (j = 0; j < n; j++)
+        {
+			// Window width: shrinks to 2 or 1 near the right edge.
+            int width = min_int(3, n - j);
+
+            store_average(dst + i * n + j, &sum, rows * width);
+
+			// Update the sum for the next column: remove the leftmost column and add the new rightmost column.
+            sub_column(&sum, src, n, i, rows, j);
+            if (j + 3 < n)
+                add_column(&sum, src, n, i, rows, j + 3);
+        }
     }
 }
 
