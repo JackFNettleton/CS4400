@@ -199,31 +199,167 @@ void eval(char *cmdline)
   char *argv2[MAXARGS]; /* argv for second command execve() */
   int bg;               /* should the job run in bg or fg? */
 
-  /* If the line contains two commands, split into two strings */
+  sigset_t mask; // Signal mask to block SIGCHLD signals
+  sigset_t prev_mask; // Previous signal mask to restore after forking
+  sigemptyset(&mask); // Initialize the signal mask
+  sigaddset(&mask, SIGCHLD); // Add SIGCHLD to the signal mask
+
+  char original_cmdline[MAXLINE]; // Buffer to store the original command line before splitting
+  strcpy(original_cmdline, cmdline); // Copy the original command line to preserve it for job list
+
+  // Check for a pipe in the command line and split it into two commands accordingly
   char* cmd2 = strchr(cmdline, '|');
-  
-  if(cmd2 != NULL && strlen(cmd2) >= 3 && (cmd2 - cmdline) >= 2){
-    // Terminate the first command with newline and null character
-    cmd2--;
-    cmd2[0] = '\n';
-    cmd2[1] = '\0';
-    // Set the second command to start after the next space
-    cmd2 += 3;
+  if (cmd2 != NULL && strlen(cmd2) >= 3 && (cmd2 - cmdline) >= 2) {
+      cmd2--;
+      cmd2[0] = '\n';
+      cmd2[1] = '\0';
+      cmd2 += 3;
+  }
+  else {
+      cmd2 = NULL;
   }
 
   /* Parse command line */
   bg = parseline(cmdline, argv1, 1); 
-  if (argv1[0] == NULL)  
-    return;   /* ignore empty lines */
+  if (argv1[0] == NULL) {
+      return;   /* ignore empty lines */
+  }
 
-  if(cmd2 != NULL)
-    parseline(cmd2, argv2, 2);
+  if (cmd2 != NULL) {
+      parseline(cmd2, argv2, 2);
+  }
 
-  addjob(jobs, 0, bg ? BG : FG, cmdline); // FIXME: Unsure about this code.
+  if (cmd2 == NULL && builtin_cmd(argv1)) {
+      return; // If the command is a built-in command, execute it and return
+  }
 
-  // TODO: Execute the command(s)
-  //       If cmd2 is NULL, then there is only one command
+  if (cmd2 != NULL) // If there is a second command, set up a pipeline
+  {
 
+	  int pipefd[2]; // File descriptors for the pipe: pipefd[0] for reading, pipefd[1] for writing
+
+      // Create the pipe.
+      if (pipe(pipefd) < 0)
+          unix_error("pipe error");
+
+	  // Block SIGCHLD signals to avoid race conditions while forking.
+      sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+	  // Create the first child.
+      pid_t pid1 = fork();
+
+	  if (pid1 == 0) // First child process
+      {
+
+		  // First child: set its own process group ID to its PID.
+          setpgid(0, 0);
+
+		  // Redirect stdout to the pipe's write end.
+          dup2(pipefd[1], STDOUT_FILENO);
+
+		  // Close the original pipe descriptors.
+          close(pipefd[0]);
+          close(pipefd[1]);
+
+		  // Restore the original signal mask.
+          sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+		  // Execute the first command.
+          execve(argv1[0], argv1, environ);
+
+          printf("%s: Command not found\n", argv1[0]);
+          fflush(stdout);
+          _exit(1);
+      }
+
+      if (pid1 < 0) 
+		  unix_error("fork error"); // If fork fails, print an error message and exit.
+
+	  setpgid(pid1, pid1); // Set the process group ID of the first child to its PID.
+
+      // Create the second child.
+      pid_t pid2 = fork();
+
+	  if (pid2 == 0) // Second child process
+      {
+
+		  // Second child: set its process group ID to the first child's PID.
+          setpgid(0, pid1);
+
+		  // Redirect stdin to the pipe's read end.
+          dup2(pipefd[0], STDIN_FILENO);
+
+		  // Close the original pipe descriptors.
+          close(pipefd[0]);
+          close(pipefd[1]);
+
+		  // Restore the original signal mask.
+          sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+		  // Execute the second command.
+          execve(argv2[0], argv2, environ);
+
+		  // If execve fails, print an error message and exit.
+          printf("%s: Command not found\n", argv2[0]);
+          fflush(stdout);
+          _exit(1);
+      }
+
+	  if (pid2 < 0) // If fork fails, print an error message and exit.
+          unix_error("fork error");
+
+	  // Set the process group ID of both children to the first child's PID.
+      setpgid(pid1, pid1);
+      setpgid(pid2, pid1);
+
+	  // Close the pipe descriptors in the parent process.
+      close(pipefd[0]);
+      close(pipefd[1]);
+
+	  // Add the first child to the job list as a foreground job.
+      addjob(jobs, pid1, FG, original_cmdline);
+
+	  // Wait for both child processes to finish.
+      waitpid(pid1, NULL, 0);
+      waitpid(pid2, NULL, 0);
+
+	  // Remove the first child from the job list after it has finished.
+      deletejob(jobs, pid1);
+
+	  // Restore the original signal mask.
+      sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+      return;
+  }
+  else // If there is no second command, execute the single command
+  {
+
+      sigprocmask(SIG_BLOCK, &mask, &prev_mask); // Block SIGCHLD signals to avoid race conditions
+
+      pid_t pid = fork(); // Fork a child process to execute the command(s)
+
+      if (pid == 0) { // Child process
+          setpgid(0, 0); // Set the process group ID of the child to its own PID
+          sigprocmask(SIG_SETMASK, &prev_mask, NULL); // Restore previous signal mask in child
+          execve(argv1[0], argv1, environ); // Execute the first command
+
+          // If execve fails, print an error message and exit.
+          printf("%s: Command not found\n", argv1[0]);
+          fflush(stdout);
+          _exit(1);
+      }
+	  else if (pid > 0) { // Parent process
+		  addjob(jobs, pid, bg ? BG : FG, cmdline); // Add the child to the job list with appropriate state
+		  if (bg) // If the job is running in the background, print its job ID and PID
+              printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+		  sigprocmask(SIG_SETMASK, &prev_mask, NULL); // Restore previous signal mask in parent
+		  if (!bg) // If the job is running in the foreground, wait for it to finish
+			  waitfg(pid); // Wait for the foreground job to finish
+      }
+      else {
+          unix_error("fork error"); // If fork fails, print an error message and exit
+      }
+  }
 
   return;
 }
@@ -310,10 +446,6 @@ int builtin_cmd(char **argv)
     listjobs(jobs);
     return 1;
   }
-  // TODO: Implement "quit" and "jobs" commands
-  //       "bg" and "fg" commands are partially handled here,
-  //       but you need to implement the do_bg and do_fg functions.
-
 
   if (!strcmp(cmd, "bg") || !strcmp(cmd, "fg")) { /* bg and fg commands */
       
@@ -350,19 +482,78 @@ int builtin_cmd(char **argv)
 /* 
  * do_bg - Execute the builtin bg command
  */
-void do_bg(int jid) 
+void do_bg(int jid)
 {
-	addjob(jobs, 0, BG, ""); // FIXME: Unsure about this code.
-  return;
+	sigset_t mask, prev_mask; // Signal sets for blocking and restoring signals
+
+	sigemptyset(&mask); // Initialize the signal set to be empty
+	sigaddset(&mask, SIGCHLD); // Add SIGCHLD to the signal set to block it
+
+    // Block SIGCHLD while modifying the job list.
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+    // Find the job using its JID.
+    struct job_t* job = getjobjid(jobs, jid);
+
+	if (job == NULL) // If the job doesn't exist, print an error message and restore the previous signal mask.
+    {
+        printf("%%%d: No such job\n", jid);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        return;
+    }
+
+    // Change the job state to background.
+    job->state = BG;
+
+    // Resume the entire process group.
+    kill(-job->pid, SIGCONT);
+
+    // Print the resumed job.
+    printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+
+    // Restore the original signal mask.
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+	return;
 }
 
 /* 
  * do_fg - Execute the builtin fg command
  */
-void do_fg(int jid) 
+void do_fg(int jid)
 {
-	addjob(jobs, 0, FG, ""); // FIXME: Unsure about this code.
-  return;
+	sigset_t mask, prev_mask; // Signal sets for blocking and restoring signals
+
+	sigemptyset(&mask); // Initialize the signal set to be empty
+	sigaddset(&mask, SIGCHLD); // Add SIGCHLD to the signal set to block it
+
+    // Block SIGCHLD while modifying the job list.
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+    // Find the job using its JID.
+    struct job_t* job = getjobjid(jobs, jid);
+
+	if (job == NULL) // If the job doesn't exist, print an error message and restore the previous signal mask.
+    {
+        printf("%%%d: No such job\n", jid);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        return;
+    }
+
+    // Save the PID before waiting.
+    pid_t pid = job->pid;
+
+    // Change the job state to foreground.
+    job->state = FG;
+
+    // Resume the process group.
+    kill(-pid, SIGCONT);
+
+    // Restore the original signal mask.
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+    // Wait until the foreground job finishes or stops.
+    waitfg(pid);
 }
 
 /* 
@@ -370,7 +561,33 @@ void do_fg(int jid)
  */
 void waitfg(pid_t pid)
 {
-  return;
+    sigset_t mask;
+    sigset_t prev_mask;
+
+    // Create a signal set containing SIGCHLD.
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+
+    // Block SIGCHLD and save the previous signal mask.
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+    // Get the job associated with this PID.
+    struct job_t* job = getjobpid(jobs, pid);
+
+    // Continue waiting while this process is the foreground job.
+    while (job != NULL && job->state == FG) {
+
+        // Temporarily restore the previous mask and wait for a signal.
+        sigsuspend(&prev_mask);
+
+        // Check the job again after receiving a signal.
+        job = getjobpid(jobs, pid);
+    }
+
+    // Restore the original signal mask.
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+    return;
 }
 
 /*****************
@@ -384,9 +601,62 @@ void waitfg(pid_t pid)
  *     available zombie children, but doesn't wait for any other
  *     currently running children to terminate.  
  */
-void sigchld_handler(int sig) 
+void sigchld_handler(int sig)
 {
-  return;
+	int olderrno = errno; // Save the current errno value to restore it later.
+	int status; // Variable to store the status of the child process.
+	pid_t pid; // Variable to store the PID of the child process.
+
+	sigset_t mask_all; // Signal set to block all signals.
+	sigset_t prev_mask; // Signal set to store the previous signal mask.
+
+    // Block all signals while modifying the job list.
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+
+    // Reap all children that have changed state.
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0)
+    {
+        struct job_t* job = getjobpid(jobs, pid);
+
+        // Ignore children that aren't tracked as jobs.
+        if (job == NULL)
+            continue;
+
+        if (WIFEXITED(status)) // Child terminated normally.
+        {
+            deletejob(jobs, pid);
+        }
+        else if (WIFSIGNALED(status)) // Child terminated due to a signal.
+        {
+            sio_puts("Job [");
+            sio_putl(job->jid);
+            sio_puts("] (");
+            sio_putl(pid);
+            sio_puts(") terminated by signal ");
+            sio_putl(WTERMSIG(status));
+            sio_puts("\n");
+
+            deletejob(jobs, pid);
+        }
+        else if (WIFSTOPPED(status)) // Child stopped due to a signal.
+        {
+            job->state = ST;
+
+            sio_puts("Job [");
+            sio_putl(job->jid);
+            sio_puts("] (");
+            sio_putl(pid);
+            sio_puts(") stopped by signal ");
+            sio_putl(WSTOPSIG(status));
+            sio_puts("\n");
+        }
+    }
+
+    // Restore the previous signal mask.
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+
+    errno = olderrno;
 }
 
 /* 
@@ -394,9 +664,28 @@ void sigchld_handler(int sig)
  *    user types ctrl-c at the keyboard.  Catch it and send it along
  *    to the foreground job.  
  */
-void sigint_handler(int sig) 
+void sigint_handler(int sig)
 {
-  return;
+	int olderrno = errno; // Save the current errno value to restore it later.
+	pid_t pid = 0; // Variable to store the PID of the foreground job.
+
+    // Find the foreground job.
+    for (int i = 0; i < MAXJOBS; i++)
+    {
+        if (jobs[i].state == FG)
+        {
+            pid = jobs[i].pid;
+            break;
+        }
+    }
+
+    // Forward SIGINT to the foreground process group.
+    if (pid > 0)
+    {
+		kill(-pid, SIGINT); // Send SIGINT to the process group of the foreground job.
+    }
+
+	errno = olderrno; // Restore the original errno value.
 }
 
 /*
@@ -404,9 +693,28 @@ void sigint_handler(int sig)
  *     the user types ctrl-z at the keyboard. Catch it and suspend the
  *     foreground job by sending a SIGTSTP.  
  */
-void sigtstp_handler(int sig) 
+void sigtstp_handler(int sig)
 {
-  return;
+	int olderrno = errno; // Save the current errno value to restore it later.
+	pid_t pid = 0; // Variable to store the PID of the foreground job.
+
+    // Find the foreground job.
+    for (int i = 0; i < MAXJOBS; i++)
+    {
+        if (jobs[i].state == FG)
+        {
+            pid = jobs[i].pid;
+            break;
+        }
+    }
+
+    // Forward SIGTSTP to the foreground process group.
+    if (pid > 0)
+    {
+		kill(-pid, SIGTSTP); // Send SIGTSTP to the process group of the foreground job.
+    }
+
+	errno = olderrno; // Restore the original errno value.
 }
 
 /*********************
